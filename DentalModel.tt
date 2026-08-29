@@ -1,0 +1,290 @@
+﻿<#@ template language="C#" debug="true" hostspecific="true" #>
+<#@ include file="EF.Utility.CS.ttinclude" #>
+<#@ output extension=".cs" #>
+<#@ import namespace="System.IO" #>
+<#@ import namespace="System.Text" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Xml" #>
+
+<#
+    // ============================================================
+    // تنظیمات
+    // ============================================================
+    var loader = new MetadataLoader(this);
+    var itemCollection = loader.CreateEdmItemCollection(GetEdmxPath());
+    
+    string entityNamespace = "DentalModel.Entities";
+    string entityFolder = "Entity";
+    
+    if (!Directory.Exists(entityFolder))
+        Directory.CreateDirectory(entityFolder);
+    
+    // دریافت تمام موجودیت‌ها
+    var allEntities = itemCollection.GetItems<EntityType>().ToList();
+    
+    // ============================================================
+    // تولید کلاس‌های موجودیت (فقط Code First)
+    // ============================================================
+    foreach (EntityType entity in allEntities)
+    {
+        var className = entity.Name;
+        var baseClass = entity.BaseType != null ? entity.BaseType.Name : "";
+        var filePath = Path.Combine(entityFolder, className + ".cs");
+        
+        using (var writer = new StreamWriter(filePath))
+        {
+            writer.WriteLine("using System;");
+            writer.WriteLine("using System.Collections.Generic;");
+            writer.WriteLine("using System.ComponentModel.DataAnnotations;");
+            writer.WriteLine("using System.ComponentModel.DataAnnotations.Schema;");
+            writer.WriteLine();
+            writer.WriteLine("namespace " + entityNamespace);
+            writer.WriteLine("{");
+            
+            // کلاس
+            string inheritance = string.IsNullOrEmpty(baseClass) ? "" : " : " + baseClass;
+            writer.WriteLine($"    public class {className}{inheritance}");
+            writer.WriteLine("    {");
+            
+            // Properties
+            foreach (EdmProperty prop in entity.Properties)
+            {
+                var propType = GetClrType(prop);
+                var propName = prop.Name;
+                var isNullable = IsNullable(prop);
+                var maxLength = GetMaxLength(prop);
+                var isIdentity = IsIdentity(prop);
+                
+                // Data Annotations برای Code First
+                if (isIdentity)
+                    writer.WriteLine("        [DatabaseGenerated(DatabaseGeneratedOption.Identity)]");
+                
+                if (!isNullable && propType != "string" && propName != "Id" && !propName.EndsWith("Id"))
+                    writer.WriteLine("        [Required]");
+                
+                if (maxLength > 0 && propType == "string")
+                    writer.WriteLine($"        [MaxLength({maxLength})]");
+                
+                writer.WriteLine($"        public {propType} {propName} {{ get; set; }}");
+                writer.WriteLine();
+            }
+            
+            // Navigation Properties
+            foreach (NavigationProperty navProp in entity.NavigationProperties)
+            {
+                var navType = navProp.ToEndMember.GetEntityType().Name;
+                var navName = navProp.Name;
+                var multiplicity = navProp.ToEndMember.RelationshipMultiplicity;
+                bool isCollection = multiplicity == RelationshipMultiplicity.Many;
+                
+                string navPropType = isCollection ? $"ICollection<{navType}>" : navType;
+                writer.WriteLine($"        public virtual {navPropType} {navName} {{ get; set; }}");
+                writer.WriteLine();
+            }
+            
+            writer.WriteLine("    }");
+            writer.WriteLine("}");
+        }
+    }
+    
+    // ============================================================
+    // تولید DbContext (Code First)
+    // ============================================================
+    var contextPath = Path.Combine("Context", "DentalContext.cs");
+    
+    // اطمینان از وجود پوشه Context
+    if (!Directory.Exists("Context"))
+        Directory.CreateDirectory("Context");
+    
+    using (var writer = new StreamWriter(contextPath))
+    {
+        writer.WriteLine("using System;");
+        writer.WriteLine("using System.Collections.Generic;");
+        writer.WriteLine("using System.Data.Entity;");
+        writer.WriteLine("using System.Data.Entity.ModelConfiguration;");
+        writer.WriteLine("using System.ComponentModel.DataAnnotations;");
+        writer.WriteLine("using System.ComponentModel.DataAnnotations.Schema;");
+        writer.WriteLine("using " + entityNamespace + ";");
+        writer.WriteLine();
+        writer.WriteLine("namespace DentalModel.Context");
+        writer.WriteLine("{");
+        writer.WriteLine("    public class DentalContext : DbContext");
+        writer.WriteLine("    {");
+        writer.WriteLine("        public DentalContext() : base(\"name=DentalContext\")");
+        writer.WriteLine("        {");
+        writer.WriteLine("            // غیرفعال کردن ایجاد دیتابیس (برای جلوگیری از پاک شدن)");
+        writer.WriteLine("            Database.SetInitializer<DentalContext>(null);");
+        writer.WriteLine("        }");
+        writer.WriteLine();
+        
+        // DbSet برای هر موجودیت پایه
+        var baseEntities = allEntities.Where(e => e.BaseType == null).ToList();
+        foreach (EntityType entity in baseEntities)
+        {
+            var entityName = entity.Name;
+            writer.WriteLine($"        public DbSet<{entityName}> {entityName}s {{ get; set; }}");
+        }
+        
+        writer.WriteLine();
+        writer.WriteLine("        protected override void OnModelCreating(DbModelBuilder modelBuilder)");
+        writer.WriteLine("        {");
+        writer.WriteLine("            base.OnModelCreating(modelBuilder);");
+        writer.WriteLine();
+        
+        // تنظیمات Fluent API
+        foreach (EntityType entity in allEntities)
+        {
+            if (entity.BaseType != null) continue;
+            
+            var entityName = entity.Name;
+            
+            writer.WriteLine($"            // تنظیمات {entityName}");
+            writer.WriteLine($"            modelBuilder.Entity<{entityName}>()");
+            writer.WriteLine($"                .ToTable(\"{entityName}s\");");
+            
+            // Primary Key
+            var keyProps = entity.KeyMembers.Select(m => m.Name).ToList();
+            if (keyProps.Count == 1)
+            {
+                writer.WriteLine($"            modelBuilder.Entity<{entityName}>()");
+                writer.WriteLine($"                .HasKey(e => e.{keyProps[0]});");
+            }
+            else if (keyProps.Count > 1)
+            {
+                writer.WriteLine($"            modelBuilder.Entity<{entityName}>()");
+                writer.WriteLine($"                .HasKey(e => new {{ {string.Join(", ", keyProps.Select(k => "e." + k))} }});");
+            }
+            
+            writer.WriteLine();
+        }
+        
+        writer.WriteLine("        }");
+        writer.WriteLine("    }");
+        writer.WriteLine("}");
+    }
+    
+    WriteLine($"✅ تولید {allEntities.Count} موجودیت در پوشه Entity");
+    WriteLine($"✅ تولید DbContext در پوشه Context");
+#>
+
+<#+
+    // ============================================================
+    // متدهای کمکی
+    // ============================================================
+    
+    string GetEdmxPath()
+    {
+        return this.Host.ResolvePath("DentalModel.edmx");
+    }
+    
+    bool IsNullable(EdmProperty prop)
+    {
+        // روش صحیح برای بررسی Nullable
+        if (prop.Nullable)
+            return true;
+            
+        // بررسی Facet
+        if (prop.TypeUsage.Facets.Contains("Nullable"))
+        {
+            var facet = prop.TypeUsage.Facets["Nullable"];
+            if (facet.Value != null)
+                return (bool)facet.Value;
+        }
+        
+        return false;
+    }
+    
+    bool IsIdentity(EdmProperty prop)
+    {
+        // بررسی StoreGeneratedPattern از طریق Facets
+        if (prop.TypeUsage.Facets.Contains("StoreGeneratedPattern"))
+        {
+            var facet = prop.TypeUsage.Facets["StoreGeneratedPattern"];
+            if (facet.Value != null)
+            {
+                var value = facet.Value.ToString();
+                return value == "Identity" || value == "Computed";
+            }
+        }
+        
+        // بررسی از طریق MetadataProperties (روش قدیمی‌تر)
+        try
+        {
+            var metadata = prop.MetadataProperties
+                .FirstOrDefault(m => m.Name == "http://schemas.microsoft.com/ado/2009/02/edm/annotation:StoreGeneratedPattern");
+            if (metadata != null && metadata.Value != null)
+            {
+                var value = metadata.Value.ToString();
+                return value == "Identity" || value == "Computed";
+            }
+        }
+        catch
+        {
+            // اگر متد موجود نبود، ignore کن
+        }
+        
+        return false;
+    }
+    
+    string GetClrType(EdmProperty prop)
+    {
+        var typeUsage = prop.TypeUsage;
+        var edmType = typeUsage.EdmType;
+        var isNullable = IsNullable(prop);
+        
+        if (edmType is PrimitiveType primitiveType)
+        {
+            switch (primitiveType.PrimitiveTypeKind)
+            {
+                case PrimitiveTypeKind.Binary: return "byte[]";
+                case PrimitiveTypeKind.Boolean: return isNullable ? "bool?" : "bool";
+                case PrimitiveTypeKind.Byte: return isNullable ? "byte?" : "byte";
+                case PrimitiveTypeKind.DateTime: return "DateTime";
+                case PrimitiveTypeKind.DateTimeOffset: return "DateTimeOffset";
+                case PrimitiveTypeKind.Decimal: return isNullable ? "decimal?" : "decimal";
+                case PrimitiveTypeKind.Double: return isNullable ? "double?" : "double";
+                case PrimitiveTypeKind.Guid: return isNullable ? "Guid?" : "Guid";
+                case PrimitiveTypeKind.Int16: return isNullable ? "short?" : "short";
+                case PrimitiveTypeKind.Int32: return isNullable ? "int?" : "int";
+                case PrimitiveTypeKind.Int64: return isNullable ? "long?" : "long";
+                case PrimitiveTypeKind.SByte: return isNullable ? "sbyte?" : "sbyte";
+                case PrimitiveTypeKind.Single: return isNullable ? "float?" : "float";
+                case PrimitiveTypeKind.String: return "string";
+                case PrimitiveTypeKind.Time: return "TimeSpan";
+                default: return "object";
+            }
+        }
+        
+        if (edmType is EnumType enumType)
+        {
+            return enumType.Name;
+        }
+        
+        return "object";
+    }
+    
+    int GetMaxLength(EdmProperty prop)
+    {
+        var typeUsage = prop.TypeUsage;
+        if (typeUsage.EdmType is PrimitiveType && typeUsage.EdmType.Name == "String")
+        {
+            if (typeUsage.Facets.Contains("MaxLength"))
+            {
+                var facet = typeUsage.Facets["MaxLength"];
+                if (facet.Value != null)
+                {
+                    try
+                    {
+                        return Convert.ToInt32(facet.Value);
+                    }
+                    catch
+                    {
+                        return 0;
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+#>
